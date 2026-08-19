@@ -75,7 +75,7 @@ def main():
           all(not r["healthy"] for r in res.values()))
     check("the stall is the only reason given",
           all(r["reasons"] == ["page did not answer the health probe "
-                              "(renderer stopped answering within 2s)"]
+                              "(renderer stopped answering (probe deadline 2s/tab))"]
               for r in res.values()),
           "; ".join(res["top"]["reasons"])[:60])
     check("a stall needs confirming, so one slow render cannot reload",

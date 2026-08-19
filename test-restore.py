@@ -1,3 +1,6 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""test-restore - window save/restore logic for enable-js-restart.py."""
 import importlib.util, json, os, shutil, sys, tempfile
 spec = importlib.util.spec_from_file_location('ejr', 'enable-js-restart.py')
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)

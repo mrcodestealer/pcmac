@@ -53,9 +53,12 @@ DEFAULTS = {
     "render_poll_seconds": 0.6,            # how often to re-check while waiting
     "scroll_settle_delay": 0.5,            # pause between scroll re-applications
     "min_panels": 1,
+    "rediscover_seconds": 30,              # min gap between full window enumerations
+    "dashboard_url": "",                   # optional; used to re-navigate a lost tab.
+                                           # Left blank, the last URL seen healthy is used.
     "min_body_text": 60,
     "osascript_timeout": 20,               # control actions (reload, re-navigate)
-    "probe_timeout_seconds": 5,            # health probe; a healthy one answers in ~0.5s,
+    "probe_timeout_seconds": 2,            # health probe; a healthy one answers in ~0.5s,
                                            # so a stall here IS the symptom, not an excuse
                                            # to keep waiting
     "pixel_check": "off",                  # off | auto | on
@@ -865,8 +868,12 @@ def resolve_roles(cfg, chrome):
         LOG.info("role %-6s -> window %s at (%s,%s) %sx%s (newly pinned)", role, w["id"],
                  w["left"], w["top"], w["right"] - w["left"], w["bottom"] - w["top"])
 
-    if changed:
+    if changed and len(resolved) == len(order):
         save_config(cfg)
+    elif changed:
+        LOG.warning("only %d of %d roles could be pinned - not persisting, so a partial "
+                    "layout cannot permanently swap %s",
+                    len(resolved), len(order), "/".join(order))
 
     out = {}
     for role, w in resolved.items():
@@ -882,9 +889,14 @@ def resolve_roles(cfg, chrome):
 # --------------------------------------------------------------------------
 
 
-def _blank_row(err):
+def _blank_row(err, stalled=False):
+    """A row we could not fill in. `stalled` distinguishes "the tab stopped answering"
+    (recoverable - reload it) from "the window lookup failed" (not recoverable by a
+    reload; needs re-discovery). Both report zero geometry, so the flag is the only
+    way to tell them apart."""
     return {"left": 0, "top": 0, "right": 0, "bottom": 0, "active_tab": 0,
-            "url": "", "title": "", "loading": False, "error": err, "probe": None}
+            "url": "", "title": "", "loading": False, "error": err, "probe": None,
+            "stalled": stalled}
 
 
 def probe_targets(cfg, chrome, targets, want_pixels=False):
@@ -910,8 +922,8 @@ def probe_targets(cfg, chrome, targets, want_pixels=False):
         # which is the symptom itself. Do NOT retry per role: recovery reloads both
         # windows regardless, so working out which one is stuck would only burn
         # another timeout each and turn a 5s detection into 15s.
-        rows = [_blank_row("renderer stopped answering within %ss" % probe_tmo)
-                for _ in specs]
+        rows = [_blank_row("renderer stopped answering (probe deadline %ss/tab)" % probe_tmo,
+                           stalled=True) for _ in specs]
     elif rows is None:
         rows = []
         for wid, ti in specs:
@@ -920,8 +932,8 @@ def probe_targets(cfg, chrome, targets, want_pixels=False):
                 rows.append(got[0] if got else _blank_row("no reply"))
             except OsaError as exc:
                 rows.append(_blank_row(
-                    "renderer stopped answering within %ss" % probe_tmo
-                    if exc.timed_out else exc.msg[:160]))
+                    "renderer stopped answering (probe deadline %ss/tab)" % probe_tmo
+                    if exc.timed_out else exc.msg[:160], stalled=exc.timed_out))
 
     out = {}
     for role, (wid, ti), row in zip(roles, specs, rows):
@@ -981,7 +993,8 @@ def wait_for_render(cfg, chrome, targets, deadline):
     return False
 
 
-def recover(cfg, chrome, targets, results, trigger_role, reasons, hard=False):
+def recover(cfg, chrome, targets, results, trigger_role, reasons, hard=False,
+            good_urls=None):
     LOG.warning("RECOVERY triggered by %s: %s", trigger_role, "; ".join(reasons))
     order = [r for r in cfg["role_order"] if r in targets]
 
@@ -1000,14 +1013,17 @@ def recover(cfg, chrome, targets, results, trigger_role, reasons, hard=False):
         wid, tab = targets[role]
         try:
             if hard:
+                # Never re-navigate to whatever the tab is showing now - if it is on
+                # chrome-error://, that would write the error page in as the target.
                 url = (results.get(role) or {}).get("meta", {}).get("url") or ""
                 if cfg["url_contains"] not in url:
-                    url = cfg.get("dashboard_url") or url
-                if url:
+                    url = (good_urls or {}).get(role) or cfg.get("dashboard_url") or ""
+                if url and cfg["url_contains"] in url:
                     chrome.set_url(wid, tab, url)
-                    LOG.info("%s: hard re-navigated", role)
+                    LOG.info("%s: hard re-navigated to the last known good URL", role)
                 else:
                     chrome.reload(wid, tab)
+                    LOG.info("%s: reloaded (no known good URL to re-navigate to)", role)
             else:
                 chrome.reload(wid, tab)
                 LOG.info("%s: reloaded", role)
@@ -1098,20 +1114,57 @@ def cycle(cfg, chrome, state, dry_run=False, cache=None):
     cache = {} if cache is None else cache
     want_pixels = cfg["pixel_check"] in ("on", "auto") \
         and not state.get("notes", {}).get("pixel_off")
+    good_urls = state.setdefault("last_good_url", {})
 
-    # fast path: reuse the pinned windows and skip the full window/tab enumeration
+    # Fast path: reuse the pinned windows and skip the full window/tab enumeration.
     targets = cache.get("targets")
     results = {}
     if targets:
         results = probe_targets(cfg, chrome, targets, want_pixels)
-        stale = len(results) != len([r for r in cfg["role_order"] if r in targets]) or any(
-            cfg["url_contains"] not in (r["meta"].get("url") or "") for r in results.values())
-        if stale:
-            targets = None
-    if not targets:
-        targets = resolve_targets(cfg, chrome, cache)
-        results = probe_targets(cfg, chrome, targets, want_pixels) if targets else {}
+
+    # Re-discovery is for when the cache can no longer DESCRIBE reality - a role we
+    # expect is absent, or a window has gone. It is emphatically NOT for a tab whose
+    # URL stopped matching: that is a fault, already graded hard, and re-resolving
+    # would lose it, because resolve_roles only considers windows that still have a
+    # matching tab. Acting on the cached (window, tab) is what repairs it.
+    vanished = [role for role, r in results.items()
+                if (r["win"].get("right", 0) - r["win"].get("left", 0)) <= 0
+                and not r["win"].get("stalled")]
+    incomplete = [r for r in cfg["role_order"] if r not in results]
+    if not targets or vanished or incomplete:
+        due = time.time() - cache.get("resolved_at", 0) >= cfg["rediscover_seconds"]
+        if due:
+            if vanished:
+                LOG.warning("window for role(s) %s is gone - re-discovering",
+                            ", ".join(vanished))
+            try:
+                fresh = resolve_targets(cfg, chrome, cache)
+                cache["resolved_at"] = time.time()
+                if fresh != targets:
+                    targets = fresh
+                    results = probe_targets(cfg, chrome, targets, want_pixels) \
+                        if targets else {}
+            except OsaError as exc:
+                # Chrome's browser process itself is wedged. Keep the cached targets so
+                # the bad streak keeps accumulating instead of being discarded every
+                # cycle, which would mean never recovering at all.
+                LOG.error("cannot enumerate Chrome windows (%s) - holding the cached "
+                          "windows so detection keeps accumulating", exc.msg[:140])
+                cache["resolved_at"] = time.time()
+        elif incomplete:
+            note = state.setdefault("notes", {})
+            if time.time() - note.get("incomplete_warned", 0) > 300:
+                note["incomplete_warned"] = time.time()
+                LOG.warning("role(s) %s have no window and are NOT being monitored",
+                            ", ".join(incomplete))
+
     if not results:
+        note = state.setdefault("notes", {})
+        if time.time() - note.get("no_results_warned", 0) > 300:
+            note["no_results_warned"] = time.time()
+            LOG.error("no monitored windows at all - open the dashboard in %d window(s) "
+                      "matching %r", len(cfg["role_order"]), cfg["url_contains"])
+        save_state(state)
         return
 
     if chrome.js_ok is False:
@@ -1125,10 +1178,16 @@ def cycle(cfg, chrome, state, dry_run=False, cache=None):
     bad_roles = []
     streak = state.setdefault("bad_streak", {})
     for role, r in results.items():
+        if (r["win"].get("right", 0) - r["win"].get("left", 0)) <= 0 \
+                and not r["win"].get("stalled"):
+            continue  # window is gone; re-discovery handles it, a reload cannot
         if r["healthy"]:
             if streak.get(role):
                 LOG.info("%s: healthy again", role)
             streak[role] = 0
+            url = r["meta"].get("url") or ""
+            if cfg["url_contains"] in url:
+                good_urls[role] = url
             maintain_scroll(cfg, chrome, role, r["id"], r["tab"], r["probe"])
             continue
         streak[role] = streak.get(role, 0) + 1
@@ -1143,16 +1202,20 @@ def cycle(cfg, chrome, state, dry_run=False, cache=None):
 
     if not bad_roles:
         LOG.info("ok - %s", " | ".join(
-            "%s: %s panels, scroll %s/%s%s" % (
+            "%s: %s panels, scroll %s/%s%s%s" % (
                 role, (r["probe"] or {}).get("panels", "?"),
-                (r["probe"] or {}).get("scrollTop", "?"), (r["probe"] or {}).get("scrollMax", "?"),
+                (r["probe"] or {}).get("scrollTop", "?"),
+                (r["probe"] or {}).get("scrollMax", "?"),
+                "" if not (r["probe"] or {}).get("perrs")
+                else ", %d panel errors" % r["probe"]["perrs"],
                 "" if r["white"] is None else ", %d%% white" % round(r["white"] * 100))
             for role, r in results.items()))
         save_state(state)
         return
 
     if dry_run:
-        LOG.warning("dry-run: would refresh both windows now (trigger: %s)", ", ".join(bad_roles))
+        LOG.warning("dry-run: would refresh both windows now (trigger: %s)",
+                    ", ".join(bad_roles))
         save_state(state)
         return
 
@@ -1164,11 +1227,13 @@ def cycle(cfg, chrome, state, dry_run=False, cache=None):
 
     trigger = bad_roles[0]
     escalate = streak.get(trigger, 0) >= cfg["bad_checks_before_action"] * 2
-    recover(cfg, chrome, targets, results, trigger, results[trigger]["reasons"], hard=escalate)
+    recover(cfg, chrome, targets, results, trigger, results[trigger]["reasons"],
+            hard=escalate, good_urls=good_urls)
     state.setdefault("recoveries", []).append(time.time())
     for role in results:
         streak[role] = 0
     cache.pop("targets", None)   # window ids may change after a hard re-navigation
+    cache.pop("resolved_at", None)
     save_state(state)
 
 

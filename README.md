@@ -63,6 +63,7 @@ restarts the watchdog if it ever dies. `./watchgrafana.py uninstall` removes it.
 | `enable-js` | tick Chrome's "Allow JavaScript from Apple Events" (see note below) |
 | `./selftest.py` | verify the injected JS and the health logic without touching the live windows |
 | `./test-timeouts.py` | verify the hung-renderer path costs one timeout, not one per window |
+| `./test-cycle.py` | drive the real `cycle()` against a fake Chrome and assert reloads actually happen |
 
 Logs: `logs/watchgrafana.log` (rotated at 2 MB). `tail -f logs/watchgrafana.log`.
 
@@ -94,21 +95,42 @@ Timing at the default 5s interval:
 
 | | detected within |
 | --- | --- |
-| blank / crashed / login-bounced page | ~5s |
-| half-rendered dashboard, white pixels | ~10s |
-| **wedged tab that stopped answering** | ~11s |
+| blank page, crashed tab, `Aw, Snap!`, `chrome-error://`, login bounce, tab navigated away | **~3-5s** (first check) |
+| half-rendered dashboard, white pixels | ~10s (second check confirms) |
+| tab wedged, no longer answering JavaScript | ~9s |
 
-That last row is the one worth understanding. A white or hung tab is precisely one
-that stops answering JavaScript, so the *probe timeout* is the detection latency —
-which is why `probe_timeout_seconds` (5s) is deliberately separate from
-`osascript_timeout` (20s, for reload and re-navigation, which can legitimately be
-slow). A healthy probe answers in ~0.5s. And when the batched probe stalls, it is
-**not** retried per window: recovery reloads both windows anyway, so identifying
-which one is stuck would only burn another timeout each.
+That last figure is arithmetic, not a measurement: the probe deadline is **per tab**,
+so a batch where both tabs are wedged spends `2 x probe_timeout_seconds` before
+returning, and a stall is graded ambiguous so it needs a confirming check —
+`(2 x 2s) + 1s + (2 x 2s)`. It has not been verified against a genuinely wedged
+renderer, only against a simulated one in `test-timeouts.py`.
 
 A cycle costs one `osascript` round-trip (~0.45s) because geometry, tab metadata and
-the in-page probe for both windows are fetched together, and the full window/tab
-enumeration only re-runs when a pinned tab stops matching.
+the in-page probe for both windows are fetched together. The full window/tab
+enumeration (~2.2s) only re-runs when a role has no window or a window has gone, and
+at most once per `rediscover_seconds`.
+
+`probe_timeout_seconds` (2s) is deliberately separate from `osascript_timeout` (20s,
+for reload and re-navigation, where slowness is legitimate). For a wedged tab the
+probe deadline *is* the detection latency, and a healthy probe answers in 0.45s.
+
+## What it does NOT catch
+
+Being straight about the blind spots, worst first:
+
+* **Stale or errored data with an intact page.** Grafana returning 5xx, a datasource
+  down, "No data" in every panel, or auto-refresh silently dying all leave a
+  correctly-shaped DOM. `evaluate()` is a structural test, not a freshness test.
+  Panel error counts are logged (`N panel errors`) but deliberately **not** treated
+  as a fault — a backend outage is not something a page reload fixes, and spending
+  the recovery budget on it would block a real recovery elsewhere.
+* **GPU / compositor white-out.** The window paints white while the page underneath
+  is healthy — the DisplayLink-after-display-sleep failure. The DOM looks perfect, so
+  nothing structural can see it. This is what `pixel_check` is for, and it is `off`.
+* **A minimized or off-Space window.** It is still probed by window id and still
+  reports healthy, because it genuinely is; it just is not on the glass.
+* **Wrong-but-plausible dashboard state**, e.g. someone changes the time range or
+  collapses a row, so `"bottom"` scrolls to a different place than you expect.
 
 ## Recovery
 
@@ -145,7 +167,9 @@ reload loop.
 | `cooldown_seconds` | `90` | minimum gap between recoveries |
 | `max_recoveries_per_hour` | `12` | hard cap |
 | `render_wait_seconds` | `30` | how long to wait for panels after a reload |
-| `probe_timeout_seconds` | `5` | health-probe deadline; this *is* your detection latency for a wedged tab |
+| `probe_timeout_seconds` | `2` | health-probe deadline **per tab**; this *is* your detection latency for a wedged tab |
+| `rediscover_seconds` | `30` | min gap between full window enumerations |
+| `dashboard_url` | `""` | optional; used to re-navigate a lost tab. Blank means "use the last URL seen healthy" |
 | `pixel_check` | `off` | `off`, `auto`, `on` — see below |
 | `white_frac_threshold` | `0.80` | fraction of near-white pixels that counts as blank |
 
@@ -204,6 +228,7 @@ state.json        recovery history + bad-check streaks (written at runtime)
 selftest.py       offline tests for the injected JS and the health logic
 test-restore.py   offline tests for the window save/restore logic
 test-timeouts.py  offline tests for the hung-renderer detection path
+test-cycle.py     offline tests that cycle() actually reloads, per failure class
 enable-js.sh      standalone Chrome-setting enabler (accessibility click)
 enable-js-restart.py  writes the pref directly, restarts Chrome, rebuilds the layout
 whitecheck.m      pixel white-check helper (Objective-C / ScreenCaptureKit)

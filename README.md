@@ -29,7 +29,15 @@ to `true` in `~/Library/Application Support/Google/Chrome/Local State`, relaunch
 
 Every line should say `[ok]`. It also prints which window got which role.
 
-**3. Start it at login:**
+**3. Put it somewhere macOS does not protect.**
+
+Do **not** leave this in `~/Downloads`, `~/Desktop` or `~/Documents`. Your terminal
+can read those folders, but the launchd agent runs as a different process with no
+access, so it dies with exit code 2 on every respawn without ever writing a log
+line — `status` shows `spawn scheduled` and a climbing `runs` count. `~/watchgrafana`
+is fine. `install` refuses to run from a protected folder, and `doctor` warns.
+
+**4. Start it at login:**
 
 ```bash
 ./watchgrafana.py install
@@ -51,6 +59,7 @@ restarts the watchdog if it ever dies. `./watchgrafana.py uninstall` removes it.
 | `run` | watch forever (this is what launchd runs) |
 | `test` | force the whole recovery path: reload both windows + re-scroll |
 | `status` | is the agent running, and how many recoveries lately |
+| `enable-js` | tick Chrome's "Allow JavaScript from Apple Events" (see note below) |
 | `./selftest.py` | verify the injected JS and the health logic without touching the live windows |
 
 Logs: `logs/watchgrafana.log` (rotated at 2 MB). `tail -f logs/watchgrafana.log`.
@@ -115,6 +124,28 @@ you care about a specific section:
 
 `./watchgrafana.py probe` prints the row names it can see, so you can copy one.
 
+## If Chrome will not allow JavaScript from Apple Events
+
+`enable-js` drives the menu item through the accessibility API, which needs the
+terminal to have Accessibility permission. On some machines Chrome ignores the
+synthetic click entirely — the item reports `enabled=true`, the click reports
+success, and no checkmark appears. When that happens, `enable-js-restart.py`
+writes the pref (`browser.allow_javascript_apple_events`) straight into Chrome's
+config instead. That needs Chrome restarted, so it saves every window's tabs and
+bounds first and rebuilds them afterwards:
+
+```bash
+./enable-js-restart.py --dry-run              # show what it would do
+./enable-js-restart.py --enable-session-restore
+```
+
+`--enable-session-restore` also switches Chrome to "Continue where you left off",
+so the wall rebuilds itself after any future crash or reboot. If anything goes
+wrong the layout is in `layout.json` and `--restore-only layout.json` replays it;
+the original prefs are backed up beside the originals as `*.bak-<timestamp>`.
+
+A Chrome update resets this setting. `doctor` reports it in one line when it happens.
+
 ## Optional: pixel-level white check
 
 The DOM checks catch a blank page whatever the cause — *except* the rare case
@@ -137,6 +168,9 @@ watchgrafana.py   the watchdog
 config.json       settings (window ids, scroll targets, thresholds)
 state.json        recovery history + bad-check streaks (written at runtime)
 selftest.py       offline tests for the injected JS and the health logic
+test-restore.py   offline tests for the window save/restore logic
+enable-js.sh      standalone Chrome-setting enabler (accessibility click)
+enable-js-restart.py  writes the pref directly, restarts Chrome, rebuilds the layout
 whitecheck.m      pixel white-check helper (Objective-C / ScreenCaptureKit)
 bin/whitecheck    compiled helper
 logs/             rotating log

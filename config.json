@@ -14,7 +14,7 @@
       "scroll": "bottom"
     }
   },
-  "interval_seconds": 20,
+  "interval_seconds": 5,
   "activate_tab_on_recovery": true,
   "steady_scroll": "on_reset",
   "bad_checks_before_action": 2,

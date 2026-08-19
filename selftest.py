@@ -139,7 +139,7 @@ def test_verdicts():
     print("\n--- health verdicts ---")
     cfg = wg.load_config()
 
-    def ev(name, expect, meta=None, probe="good", white=None):
+    def ev(name, expect, meta=None, probe="good", white=None, hard=None):
         m = dict(META)
         m.update(meta or {})
         if probe == "good":
@@ -149,25 +149,32 @@ def test_verdicts():
         else:
             p = dict(GOOD)
             p.update(probe)
-        healthy, reasons = wg.evaluate(cfg, "top", m, p, white)
-        check(name, healthy == expect,
-              ("healthy" if healthy else "UNHEALTHY: " + "; ".join(reasons)))
+        healthy, reasons, is_hard = wg.evaluate(cfg, "top", m, p, white)
+        ok = healthy == expect and (hard is None or is_hard == hard)
+        check(name, ok, ("healthy" if healthy
+                         else "%s: %s" % ("IMMEDIATE" if is_hard else "needs 2 checks",
+                                          "; ".join(reasons))))
 
     ev("normal dashboard", True)
-    ev("blank white page", False, probe={"text": 0, "panels": 0, "charts": 0})
-    ev("panels present, nothing painted", False, probe={"charts": 0})
-    ev("background tab, nothing painted", True, probe={"charts": 0, "hidden": True})
-    ev("bounced to Grafana login", False, probe={"login": True})
-    ev("Grafana error screen", False, probe={"appErr": 1})
-    ev("Aw-Snap crash page", False, meta={"title": "Aw, Snap!"}, probe=None)
-    ev("chrome-error:// url", False, meta={"url": "chrome-error://chromewebdata/"}, probe=None)
+    # unambiguous -> act on the very first check
+    ev("blank white page", False, probe={"text": 0, "panels": 0, "charts": 0}, hard=True)
+    ev("bounced to Grafana login", False, probe={"login": True}, hard=True)
+    ev("Grafana error screen", False, probe={"appErr": 1}, hard=True)
+    ev("Aw-Snap crash page", False, meta={"title": "Aw, Snap!"}, probe=None, hard=True)
+    ev("chrome-error:// url", False, meta={"url": "chrome-error://chromewebdata/"},
+       probe=None, hard=True)
     ev("tab navigated elsewhere", False,
-       meta={"url": "https://ecs.console.alibabacloud.com/"}, probe=None)
+       meta={"url": "https://ecs.console.alibabacloud.com/"}, probe=None, hard=True)
+    # ambiguous -> confirm before acting
+    ev("panels present, nothing painted", False, probe={"charts": 0}, hard=False)
     ev("renderer hung, no probe answer", False,
-       meta={"probe_error": "renderer did not answer within 20s"}, probe=None)
+       meta={"probe_error": "renderer did not answer within 20s"}, probe=None, hard=False)
+    ev("screen is 95% white", False, white=0.95, hard=False)
+    # must not trip at all
+    ev("background tab, nothing painted", True, probe={"charts": 0, "hidden": True})
     ev("JS-from-AppleEvents off (must NOT trip)", True, probe=None)
-    ev("screen is 95% white", False, white=0.95)
     ev("screen is 30% white (normal dark theme)", True, white=0.30)
+    ev("half-loaded page still has text", False, probe={"panels": 0}, hard=False)
 
 
 if __name__ == "__main__":

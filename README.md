@@ -83,8 +83,22 @@ A window is unhealthy when any of these is true:
 * the tab navigated away from the dashboard URL
 * *(optional)* the window is measurably white on screen — see below
 
-Two consecutive bad checks are required before acting (`bad_checks_before_action`),
-so a single slow refresh never triggers a reload.
+Signals are graded. A **clearly** dead page - no text *and* no panels, a login
+bounce, Grafana's error screen, `Aw, Snap!`, a `chrome-error://` tab - is acted on
+the **first** time it is seen. Ambiguous ones - a half-rendered dashboard, a single
+missed probe, a white-looking window - wait for `bad_checks_before_action` in a row,
+so a slow refresh never triggers a reload.
+
+Timing at the default 5s interval:
+
+| | detected within |
+| --- | --- |
+| blank / crashed / login-bounced page | ~5s |
+| half-rendered, hung renderer, white pixels | ~10s |
+
+A cycle costs one `osascript` round-trip (~0.45s) because geometry, tab metadata and
+the in-page probe for both windows are fetched together, and the full window/tab
+enumeration only re-runs when a pinned tab stops matching.
 
 ## Recovery
 
@@ -112,10 +126,12 @@ reload loop.
 | `role_order` | `["top","bottom"]` | leftmost matching window = `top`, next = `bottom` |
 | `roles.<role>.window_id` | pinned ids | Chrome window id; re-pinned automatically after a Chrome restart |
 | `roles.<role>.scroll` | `top` / `bottom` | `top`, `bottom`, `fraction:0.6`, `px:1200`, `row:Pulsar 投注` |
-| `interval_seconds` | `20` | how often to check |
+| `interval_seconds` | `5` | how often to check |
 | `activate_tab_on_recovery` | `true` | pull the dashboard tab back to the front during recovery |
 | `steady_scroll` | `on_reset` | `off`, `on_reset` (only fix a scroll that jumped back to the top), `always` |
-| `bad_checks_before_action` | `2` | consecutive bad checks before reloading |
+| `bad_checks_before_action` | `2` | consecutive bad checks before reloading — **ambiguous signals only** |
+| `render_poll_seconds` | `0.6` | how often to re-check while waiting for panels after a reload |
+| `scroll_settle_delay` | `0.5` | pause between scroll re-applications as the page grows |
 | `cooldown_seconds` | `90` | minimum gap between recoveries |
 | `max_recoveries_per_hour` | `12` | hard cap |
 | `render_wait_seconds` | `30` | how long to wait for panels after a reload |

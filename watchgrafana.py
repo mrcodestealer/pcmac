@@ -40,15 +40,18 @@ DEFAULTS = {
         "top":    {"window_id": None, "scroll": "top"},
         "bottom": {"window_id": None, "scroll": "bottom"},
     },
-    "interval_seconds": 20,
+    "interval_seconds": 5,
     "activate_tab_on_recovery": True,
     "steady_scroll": "on_reset",          # off | on_reset | always
     "scroll_reset_epsilon_px": 60,
     "scroll_tolerance_px": 200,
-    "bad_checks_before_action": 2,         # consecutive bad probes needed to act
+    "bad_checks_before_action": 2,         # for ambiguous signals only; a clearly
+                                           # blank/crashed page acts on the first check
     "cooldown_seconds": 90,                # min gap between recoveries
     "max_recoveries_per_hour": 12,
     "render_wait_seconds": 30,             # how long to wait for panels after a reload
+    "render_poll_seconds": 0.6,            # how often to re-check while waiting
+    "scroll_settle_delay": 0.5,            # pause between scroll re-applications
     "min_panels": 1,
     "min_body_text": 60,
     "osascript_timeout": 20,
@@ -214,6 +217,75 @@ on run argv
       end repeat
     end tell
   end using terms from
+  return out
+end run
+"""
+
+BATCH_SCPT = """
+on run argv
+  set appName to item 1 of argv
+  set js to item 2 of argv
+  set tmo to (item 3 of argv) as integer
+  set US to (character id 31)
+  set RS to (character id 30)
+  set out to ""
+  with timeout of tmo seconds
+    using terms from application "Google Chrome"
+      tell application appName
+        repeat with i from 4 to (count of argv)
+          set spec to item i of argv
+          set oldTID to AppleScript's text item delimiters
+          set AppleScript's text item delimiters to ","
+          set parts to text items of spec
+          set AppleScript's text item delimiters to oldTID
+          set wid to (item 1 of parts) as integer
+          set ti to (item 2 of parts) as integer
+          set lft to 0
+          set tp to 0
+          set rgt to 0
+          set btm to 0
+          set ai to 0
+          set u to ""
+          set ttl to ""
+          set ld to "false"
+          set jsres to ""
+          set errs to ""
+          try
+            set theWin to (first window whose id is wid)
+            set b to bounds of theWin
+            set lft to item 1 of b
+            set tp to item 2 of b
+            set rgt to item 3 of b
+            set btm to item 4 of b
+            try
+              set ai to active tab index of theWin
+            end try
+            set t to tab ti of theWin
+            try
+              set u to URL of t
+            end try
+            try
+              set ttl to title of t
+            end try
+            try
+              if loading of t then set ld to "true"
+            end try
+            try
+              set jsres to (execute t javascript js)
+            on error e
+              set errs to e
+            end try
+          on error e2
+            set errs to e2
+          end try
+          set rec to (lft as text) & US & (tp as text) & US & (rgt as text) & US
+          set rec to rec & (btm as text) & US & (ai as text) & US & u & US & ttl
+          set rec to rec & US & ld & US & errs & US & jsres
+          set out to out & rec & RS
+        end repeat
+      end tell
+    end using terms from
+  end timeout
   return out
 end run
 """
@@ -427,6 +499,39 @@ class Chrome(object):
             LOG.debug("non-JSON JS reply: %r", raw[:400])
             return None
 
+    def batch(self, specs, code, timeout=None):
+        """One osascript round-trip for every monitored tab: geometry, tab metadata
+        and the in-page health probe together. Five spawns per cycle become one."""
+        t = timeout or self.timeout
+        args = [self.app, code, t] + ["%d,%d" % (w, i) for w, i in specs]
+        out = osa(BATCH_SCPT, *args, timeout=t + 5)
+        rows = []
+        for rec in out.split(RS):
+            if not rec.strip():
+                continue
+            f = rec.split(US)
+            while len(f) < 10:
+                f.append("")
+            err = f[8]
+            if err and JS_DISABLED_MARK in err:
+                self.js_ok = False
+            elif f[9]:
+                self.js_ok = True
+            probe = None
+            if f[9]:
+                try:
+                    probe = json.loads(f[9])
+                except Exception:
+                    probe = None
+            rows.append({
+                "left": int(f[0] or 0), "top": int(f[1] or 0),
+                "right": int(f[2] or 0), "bottom": int(f[3] or 0),
+                "active_tab": int(f[4] or 0),
+                "url": f[5], "title": f[6], "loading": f[7] == "true",
+                "error": err, "probe": probe,
+            })
+        return rows
+
     def reload(self, wid, ti):
         osa(RELOAD_SCPT, self.app, wid, ti, timeout=self.timeout + 15)
 
@@ -607,37 +712,54 @@ def looks_like_error_page(meta):
 
 
 def evaluate(cfg, role, meta, probe, white):
-    """Return (healthy: bool, reasons: [str])."""
-    bad = []
+    """Return (healthy, reasons, hard).
+
+    `hard` marks a failure that is unambiguous on a single observation - a crashed
+    tab, a login bounce, a page with neither text nor panels. Those are acted on at
+    once. Everything else (a half-rendered dashboard, a renderer that missed one
+    probe, a white-looking window) waits for `bad_checks_before_action` in a row, so
+    a slow refresh never triggers a reload.
+    """
+    bad = []  # (reason, hard)
+
     err = looks_like_error_page(meta)
     if err:
-        bad.append(err)
+        bad.append((err, True))
 
     if cfg["url_contains"] not in (meta.get("url") or ""):
-        bad.append("tab navigated away from the dashboard (%s)" % (meta.get("url") or "")[:80])
+        bad.append(("tab navigated away from the dashboard (%s)"
+                    % (meta.get("url") or "")[:80], True))
 
     if probe is None:
-        # JS unavailable or it threw: only trust it as a signal when JS normally works
+        # JS unavailable or it threw: only a signal when JS normally works
         if meta.get("probe_error"):
-            bad.append("page did not answer the health probe (%s)" % meta["probe_error"])
+            bad.append(("page did not answer the health probe (%s)"
+                        % meta["probe_error"], False))
     else:
         if not probe.get("ok"):
-            bad.append("probe error: %s" % probe.get("jsErr"))
+            bad.append(("probe error: %s" % probe.get("jsErr"), True))
         if probe.get("login"):
-            bad.append("bounced to the Grafana login page")
+            bad.append(("bounced to the Grafana login page", True))
         if probe.get("appErr"):
-            bad.append("Grafana rendered its error screen")
-        if probe.get("text", 0) < cfg["min_body_text"]:
-            bad.append("page is blank (%s chars of text)" % probe.get("text"))
-        if probe.get("panels", 0) < cfg["min_panels"]:
-            bad.append("no dashboard panels in the DOM")
-        elif probe.get("charts", 0) < 1 and not probe.get("hidden"):
-            bad.append("panels present but nothing rendered inside them")
+            bad.append(("Grafana rendered its error screen", True))
+
+        blank_text = probe.get("text", 0) < cfg["min_body_text"]
+        no_panels = probe.get("panels", 0) < cfg["min_panels"]
+        if blank_text and no_panels:
+            bad.append(("page is completely blank (%s chars of text, no panels)"
+                        % probe.get("text"), True))
+        else:
+            if blank_text:
+                bad.append(("almost no text on the page (%s chars)" % probe.get("text"), False))
+            if no_panels:
+                bad.append(("no dashboard panels in the DOM", False))
+            elif probe.get("charts", 0) < 1 and not probe.get("hidden"):
+                bad.append(("panels present but nothing rendered inside them", False))
 
     if white is not None and white >= cfg["white_frac_threshold"]:
-        bad.append("window is %d%% white on screen" % round(white * 100))
+        bad.append(("window is %d%% white on screen" % round(white * 100), False))
 
-    return (len(bad) == 0), bad
+    return (not bad), [t for t, _ in bad], any(h for _, h in bad)
 
 
 # --------------------------------------------------------------------------
@@ -755,44 +877,65 @@ def resolve_roles(cfg, chrome):
 # --------------------------------------------------------------------------
 
 
-def check_role(cfg, chrome, role, win, tab, want_pixels):
-    meta = {"url": "", "title": "", "loading": False}
+def _blank_row(err):
+    return {"left": 0, "top": 0, "right": 0, "bottom": 0, "active_tab": 0,
+            "url": "", "title": "", "loading": False, "error": err, "probe": None}
+
+
+def probe_targets(cfg, chrome, targets, want_pixels=False):
+    """Health-check every monitored tab. One osascript round-trip for all of them,
+    falling back to one call each if a hung renderer stalls the batch."""
+    roles = [r for r in cfg["role_order"] if r in targets]
+    if not roles:
+        return {}
+    specs = [targets[r] for r in roles]
+
+    rows = None
     try:
-        meta = chrome.tab_meta(win["id"], tab)
-    except OsaError as exc:
-        meta["probe_error"] = "tab is not responding (%s)" % exc.msg[:120]
+        rows = chrome.batch(specs, JS_PROBE)
+        if len(rows) != len(specs):
+            rows = None
+    except OsaError:
+        rows = None
 
-    probe = None
-    if not meta.get("probe_error"):
-        try:
-            probe = chrome.js_json(win["id"], tab, JS_PROBE)
-            if probe is None:
-                meta["probe_error"] = "probe returned nothing"
-        except OsaError as exc:
-            if JS_DISABLED_MARK in exc.msg:
-                pass  # doctor reports this; do not treat it as a page fault
-            elif exc.timed_out:
-                meta["probe_error"] = "renderer did not answer within %ss" % cfg["osascript_timeout"]
-            else:
-                meta["probe_error"] = exc.msg[:160]
+    if rows is None:
+        rows = []
+        for wid, ti in specs:
+            try:
+                got = chrome.batch([(wid, ti)], JS_PROBE)
+                rows.append(got[0] if got else _blank_row("no reply"))
+            except OsaError as exc:
+                rows.append(_blank_row(
+                    "renderer did not answer within %ss" % cfg["osascript_timeout"]
+                    if exc.timed_out else exc.msg[:160]))
 
-    white = None
-    if want_pixels and win["active_tab"] == tab:
-        white, werr = white_fraction(win)
-        if werr:
-            LOG.debug("pixel check unavailable for %s: %s", role, werr)
+    out = {}
+    for role, (wid, ti), row in zip(roles, specs, rows):
+        meta = {"url": row["url"], "title": row["title"], "loading": row["loading"]}
+        if row["error"] and JS_DISABLED_MARK not in row["error"]:
+            meta["probe_error"] = row["error"][:160]
+        elif row["probe"] is None and not row["error"]:
+            meta["probe_error"] = "probe returned nothing"
 
-    healthy, reasons = evaluate(cfg, role, meta, probe, white)
-    return {"role": role, "win": win, "tab": tab, "meta": meta, "probe": probe,
-            "white": white, "healthy": healthy, "reasons": reasons}
+        white = None
+        if want_pixels and row["active_tab"] == ti and row["right"] > row["left"]:
+            white, werr = white_fraction(row)
+            if werr:
+                LOG.debug("pixel check unavailable for %s: %s", role, werr)
+
+        healthy, reasons, hard = evaluate(cfg, role, meta, row["probe"], white)
+        out[role] = {"role": role, "win": row, "id": wid, "tab": ti, "meta": meta,
+                     "probe": row["probe"], "white": white, "healthy": healthy,
+                     "reasons": reasons, "hard": hard}
+    return out
 
 
-def apply_scroll(cfg, chrome, role, win, tab, target, settle_rounds=3):
+def apply_scroll(cfg, chrome, role, wid, tab, target, settle_rounds=3):
     """Scroll to target, re-applying while Grafana lazily grows the page."""
     last = None
     for i in range(settle_rounds):
         try:
-            res = chrome.js_json(win["id"], tab, js_scroll(target))
+            res = chrome.js_json(wid, tab, js_scroll(target))
         except OsaError as exc:
             LOG.warning("scroll of %s failed: %s", role, exc.msg[:160])
             return None
@@ -804,80 +947,81 @@ def apply_scroll(cfg, chrome, role, win, tab, target, settle_rounds=3):
             return res
         last = res
         if i < settle_rounds - 1:
-            time.sleep(1.2)
+            time.sleep(cfg["scroll_settle_delay"])
     return last
 
 
 def wait_for_render(cfg, chrome, targets, deadline):
     """Poll until every tab has panels again (or the deadline passes)."""
+    specs = [targets[r] for r in cfg["role_order"] if r in targets]
     while time.time() < deadline:
-        time.sleep(1.5)
-        allgood = True
-        for role, (win, tab) in targets.items():
-            try:
-                p = chrome.js_json(win["id"], tab, JS_PROBE)
-            except OsaError:
-                allgood = False
-                continue
-            if not p or p.get("panels", 0) < cfg["min_panels"] or p.get("ready") == "loading":
-                allgood = False
-        if allgood:
+        time.sleep(cfg["render_poll_seconds"])
+        try:
+            rows = chrome.batch(specs, JS_PROBE)
+        except OsaError:
+            continue
+        if len(rows) == len(specs) and all(
+                r["probe"] and r["probe"].get("panels", 0) >= cfg["min_panels"]
+                and r["probe"].get("ready") != "loading" for r in rows):
             return True
     return False
 
 
-def recover(cfg, chrome, targets, trigger_role, reasons, hard=False):
+def recover(cfg, chrome, targets, results, trigger_role, reasons, hard=False):
     LOG.warning("RECOVERY triggered by %s: %s", trigger_role, "; ".join(reasons))
     order = [r for r in cfg["role_order"] if r in targets]
 
-    for role in order:
-        win, tab = targets[role]
-        if cfg["activate_tab_on_recovery"] and win["active_tab"] != tab:
-            try:
-                chrome.activate_tab(win["id"], tab)
-                LOG.info("%s: brought the dashboard tab (%d) to the front", role, tab)
-            except OsaError as exc:
-                LOG.warning("%s: could not switch tab: %s", role, exc.msg[:120])
+    if cfg["activate_tab_on_recovery"]:
+        for role in order:
+            wid, tab = targets[role]
+            row = (results.get(role) or {}).get("win") or {}
+            if row.get("active_tab") and row["active_tab"] != tab:
+                try:
+                    chrome.activate_tab(wid, tab)
+                    LOG.info("%s: brought the dashboard tab (%d) to the front", role, tab)
+                except OsaError as exc:
+                    LOG.warning("%s: could not switch tab: %s", role, exc.msg[:120])
 
     for role in order:
-        win, tab = targets[role]
+        wid, tab = targets[role]
         try:
             if hard:
-                url = chrome.tab_meta(win["id"], tab).get("url") or ""
+                url = (results.get(role) or {}).get("meta", {}).get("url") or ""
                 if cfg["url_contains"] not in url:
                     url = cfg.get("dashboard_url") or url
                 if url:
-                    chrome.set_url(win["id"], tab, url)
+                    chrome.set_url(wid, tab, url)
                     LOG.info("%s: hard re-navigated", role)
                 else:
-                    chrome.reload(win["id"], tab)
+                    chrome.reload(wid, tab)
             else:
-                chrome.reload(win["id"], tab)
+                chrome.reload(wid, tab)
                 LOG.info("%s: reloaded", role)
         except OsaError as exc:
             LOG.error("%s: reload failed: %s", role, exc.msg[:160])
 
     if hard:
         for role in order:
-            win, _ = targets[role]
             try:
-                chrome.nudge(win["id"])
+                chrome.nudge(targets[role][0])
                 LOG.info("%s: nudged window size to force a repaint", role)
             except OsaError:
                 pass
 
     rendered = wait_for_render(cfg, chrome, targets, time.time() + cfg["render_wait_seconds"])
-    LOG.info("panels back after reload: %s", "yes" if rendered else "not within %ss" % cfg["render_wait_seconds"])
+    LOG.info("panels back after reload: %s",
+             "yes" if rendered else "not within %ss" % cfg["render_wait_seconds"])
 
     for role in order:
-        win, tab = targets[role]
+        wid, tab = targets[role]
         target = (cfg["roles"].get(role) or {}).get("scroll") or "top"
-        res = apply_scroll(cfg, chrome, role, win, tab, target)
+        res = apply_scroll(cfg, chrome, role, wid, tab, target)
         if res and res.get("ok"):
-            LOG.info("%s: scrolled to %r -> %s/%s px", role, target, res.get("got"), res.get("max"))
+            LOG.info("%s: scrolled to %r -> %s/%s px", role, target,
+                     res.get("got"), res.get("max"))
 
 
-def maintain_scroll(cfg, chrome, role, win, tab, probe):
+def maintain_scroll(cfg, chrome, role, wid, tab, probe):
     """Put a window back on its slice of the dashboard if Grafana reset it."""
     mode = cfg["steady_scroll"]
     if mode == "off" or not probe:
@@ -907,7 +1051,7 @@ def maintain_scroll(cfg, chrome, role, win, tab, probe):
     else:
         return
 
-    res = apply_scroll(cfg, chrome, role, win, tab, target, settle_rounds=2)
+    res = apply_scroll(cfg, chrome, role, wid, tab, target, settle_rounds=2)
     if res and res.get("ok"):
         LOG.info("%s: re-pinned scroll to %r (was %spx) -> %s/%s",
                  role, target, top, res.get("got"), res.get("max"))
@@ -924,48 +1068,67 @@ def throttled(cfg, state):
     return None
 
 
-def cycle(cfg, chrome, state, dry_run=False):
-    targets, all_wins = resolve_roles(cfg, chrome)
+def resolve_targets(cfg, chrome, cache):
+    """{role: (window_id, tab_index)}, re-discovered only when the cache goes stale."""
+    resolved, _ = resolve_roles(cfg, chrome)
+    targets = {role: (w["id"], t) for role, (w, t) in resolved.items()}
+    cache["targets"] = targets
     missing = [r for r in cfg["role_order"] if r not in targets]
     if missing:
-        LOG.warning("no window found for role(s) %s — open the dashboard in %d window(s) matching %r",
-                    ", ".join(missing), len(missing), cfg["url_contains"])
-    if not targets:
-        return
+        LOG.warning("no window found for role(s) %s - open the dashboard in %d window(s) "
+                    "matching %r", ", ".join(missing), len(missing), cfg["url_contains"])
+    return targets
 
-    want_pixels = cfg["pixel_check"] in ("on", "auto") and not state.get("notes", {}).get("pixel_off")
+
+def cycle(cfg, chrome, state, dry_run=False, cache=None):
+    cache = {} if cache is None else cache
+    want_pixels = cfg["pixel_check"] in ("on", "auto") \
+        and not state.get("notes", {}).get("pixel_off")
+
+    # fast path: reuse the pinned windows and skip the full window/tab enumeration
+    targets = cache.get("targets")
     results = {}
-    for role in cfg["role_order"]:
-        if role not in targets:
-            continue
-        win, tab = targets[role]
-        results[role] = check_role(cfg, chrome, role, win, tab, want_pixels)
+    if targets:
+        results = probe_targets(cfg, chrome, targets, want_pixels)
+        stale = len(results) != len([r for r in cfg["role_order"] if r in targets]) or any(
+            cfg["url_contains"] not in (r["meta"].get("url") or "") for r in results.values())
+        if stale:
+            targets = None
+    if not targets:
+        targets = resolve_targets(cfg, chrome, cache)
+        results = probe_targets(cfg, chrome, targets, want_pixels) if targets else {}
+    if not results:
+        return
 
     if chrome.js_ok is False:
         note = state.setdefault("notes", {})
         if time.time() - note.get("js_warned", 0) > 1800:
             note["js_warned"] = time.time()
-            LOG.error("Chrome is not allowing JavaScript from Apple Events, so blank-page detection "
-                      "and scrolling are both disabled. Fix: Chrome menu bar -> View -> Developer "
-                      "-> Allow JavaScript from Apple Events.")
+            LOG.error("Chrome is not allowing JavaScript from Apple Events, so blank-page "
+                      "detection and scrolling are both disabled. Fix: Chrome menu bar -> "
+                      "View > Developer > Allow JavaScript from Apple Events.")
 
     bad_roles = []
+    streak = state.setdefault("bad_streak", {})
     for role, r in results.items():
-        streak = state.setdefault("bad_streak", {})
         if r["healthy"]:
             if streak.get(role):
                 LOG.info("%s: healthy again", role)
             streak[role] = 0
-            maintain_scroll(cfg, chrome, role, r["win"], r["tab"], r["probe"])
+            maintain_scroll(cfg, chrome, role, r["id"], r["tab"], r["probe"])
+            continue
+        streak[role] = streak.get(role, 0) + 1
+        if r["hard"]:
+            LOG.warning("%s: unhealthy - %s", role, "; ".join(r["reasons"]))
+            bad_roles.append(role)
         else:
-            streak[role] = streak.get(role, 0) + 1
-            LOG.warning("%s: unhealthy (%d/%d) — %s", role, streak[role],
+            LOG.warning("%s: unhealthy (%d/%d) - %s", role, streak[role],
                         cfg["bad_checks_before_action"], "; ".join(r["reasons"]))
             if streak[role] >= cfg["bad_checks_before_action"]:
                 bad_roles.append(role)
 
     if not bad_roles:
-        LOG.info("ok — %s", " | ".join(
+        LOG.info("ok - %s", " | ".join(
             "%s: %s panels, scroll %s/%s%s" % (
                 role, (r["probe"] or {}).get("panels", "?"),
                 (r["probe"] or {}).get("scrollTop", "?"), (r["probe"] or {}).get("scrollMax", "?"),
@@ -981,17 +1144,17 @@ def cycle(cfg, chrome, state, dry_run=False):
 
     why = throttled(cfg, state)
     if why:
-        LOG.warning("holding off on recovery — %s", why)
+        LOG.warning("holding off on recovery - %s", why)
         save_state(state)
         return
 
     trigger = bad_roles[0]
-    prev = state.get("bad_streak", {}).get(trigger, 0)
-    hard = prev >= cfg["bad_checks_before_action"] * 2
-    recover(cfg, chrome, targets, trigger, results[trigger]["reasons"], hard=hard)
+    escalate = streak.get(trigger, 0) >= cfg["bad_checks_before_action"] * 2
+    recover(cfg, chrome, targets, results, trigger, results[trigger]["reasons"], hard=escalate)
     state.setdefault("recoveries", []).append(time.time())
     for role in results:
-        state.setdefault("bad_streak", {})[role] = 0
+        streak[role] = 0
+    cache.pop("targets", None)   # window ids may change after a hard re-navigation
     save_state(state)
 
 
@@ -1036,46 +1199,50 @@ def cmd_pin(cfg, chrome, args):
 
 
 def cmd_probe(cfg, chrome, args):
-    targets, _ = resolve_roles(cfg, chrome)
+    targets = resolve_targets(cfg, chrome, {})
+    results = probe_targets(cfg, chrome, targets, cfg["pixel_check"] in ("on", "auto"))
     for role in cfg["role_order"]:
-        if role not in targets:
+        if role not in results:
             print("%s: no window" % role)
             continue
-        win, tab = targets[role]
-        r = check_role(cfg, chrome, role, win, tab, cfg["pixel_check"] in ("on", "auto"))
-        print("=== %s (window %s, tab %s) %s" % (role, win["id"], tab,
-                                                 "HEALTHY" if r["healthy"] else "UNHEALTHY"))
+        r = results[role]
+        print("=== %s (window %s, tab %s) %s" % (
+            role, r["id"], r["tab"], "HEALTHY" if r["healthy"] else "UNHEALTHY"))
         print("    url    : %s" % r["meta"].get("url", "")[:110])
         print("    title  : %s" % r["meta"].get("title", "")[:110])
         if r["meta"].get("probe_error"):
             print("    probe  : %s" % r["meta"]["probe_error"])
         if r["probe"]:
-            p = r["probe"]
+            pr = r["probe"]
             print("    panels=%s charts=%s text=%s panelErrors=%s hidden=%s" % (
-                p.get("panels"), p.get("charts"), p.get("text"), p.get("perrs"), p.get("hidden")))
+                pr.get("panels"), pr.get("charts"), pr.get("text"),
+                pr.get("perrs"), pr.get("hidden")))
             print("    scroller=%s scrollTop=%s scrollMax=%s" % (
-                p.get("scroller"), p.get("scrollTop"), p.get("scrollMax")))
-            print("    rows   : %s" % ", ".join(p.get("rows", [])[:12]))
+                pr.get("scroller"), pr.get("scrollTop"), pr.get("scrollMax")))
+            print("    rows   : %s" % ", ".join(pr.get("rows", [])[:12]))
         if r["white"] is not None:
             print("    white  : %d%%" % round(r["white"] * 100))
         for why in r["reasons"]:
             print("    !! %s" % why)
+        if not r["healthy"]:
+            print("    action : %s" % ("immediately" if r["hard"]
+                                       else "after %d checks in a row"
+                                       % cfg["bad_checks_before_action"]))
 
 
 def cmd_scroll(cfg, chrome, args):
-    """scroll <role> [target] — apply (or preview) a scroll target."""
+    """scroll <role> [target] - apply a scroll target now."""
     if not args:
         print("usage: watchgrafana scroll <role> [top|bottom|fraction:0.5|px:1200|row:TEXT]")
         return
     role = args[0]
     target = args[1] if len(args) > 1 else (cfg["roles"].get(role) or {}).get("scroll") or "top"
-    targets, _ = resolve_roles(cfg, chrome)
+    targets = resolve_targets(cfg, chrome, {})
     if role not in targets:
         print("no window pinned for role %r" % role)
         return
-    win, tab = targets[role]
-    res = apply_scroll(cfg, chrome, role, win, tab, target)
-    print(json.dumps(res, indent=2))
+    wid, tab = targets[role]
+    print(json.dumps(apply_scroll(cfg, chrome, role, wid, tab, target), indent=2))
 
 
 def cmd_doctor(cfg, chrome, args):
@@ -1294,12 +1461,13 @@ def cmd_status(cfg, chrome, args):
 
 def cmd_test(cfg, chrome, args):
     """Run the full recovery path once, as if a window had gone white."""
-    targets, _ = resolve_roles(cfg, chrome)
+    targets = resolve_targets(cfg, chrome, {})
     if not targets:
         print("no windows resolved")
         return
+    results = probe_targets(cfg, chrome, targets)
     trigger = cfg["role_order"][0] if cfg["role_order"][0] in targets else list(targets)[0]
-    recover(cfg, chrome, targets, trigger, ["forced by `watchgrafana test`"], hard=False)
+    recover(cfg, chrome, targets, results, trigger, ["forced by `watchgrafana test`"])
 
 
 NO_AX_MARKS = ("assistive access", "-25211", "-1719", "not authorized",
@@ -1307,9 +1475,9 @@ NO_AX_MARKS = ("assistive access", "-25211", "-1719", "not authorized",
 
 
 def js_works(chrome, targets):
-    for role, (win, tab) in targets.items():
+    for role, (wid, tab) in targets.items():
         try:
-            chrome.js(win["id"], tab, "1+1")
+            chrome.js(wid, tab, "1+1")
             return True, None
         except OsaError as exc:
             return False, exc
@@ -1318,14 +1486,14 @@ def js_works(chrome, targets):
 
 def cmd_enable_js(cfg, chrome, args):
     """Tick Chrome's View > Developer > Allow JavaScript from Apple Events for us."""
-    targets, _ = resolve_roles(cfg, chrome)
+    targets = resolve_targets(cfg, chrome, {})
     if not targets:
         print("No Chrome window has the dashboard open, so there is nothing to verify against.")
         return
 
     ok, exc = js_works(chrome, targets)
     if ok:
-        print("[ok] Chrome already allows JavaScript from Apple Events — nothing to do.")
+        print("[ok] Chrome already allows JavaScript from Apple Events - nothing to do.")
         return
     if exc and JS_DISABLED_MARK not in exc.msg:
         print("[FAIL] JavaScript is failing for a different reason:\n       %s" % exc.msg[:300])
@@ -1342,9 +1510,6 @@ def cmd_enable_js(cfg, chrome, args):
             print("       Grant it once, then re-run this command:")
             print("         System Settings > Privacy & Security > Accessibility")
             print("         > turn ON the app you are running this from (Terminal / iTerm)")
-            print()
-            print("       macOS may have just shown you that prompt. Approving it is what")
-            print("       lets the watchdog re-arm this Chrome setting after Chrome updates.")
         else:
             print("[FAIL] could not drive the menu: %s" % exc.msg[:300])
         return
@@ -1352,40 +1517,40 @@ def cmd_enable_js(cfg, chrome, args):
     if res.startswith("NOTFOUND"):
         print("[FAIL] no 'Apple Events' item in Chrome's Developer menu. Items found:")
         print("       %s" % res.split(":", 1)[1].strip()[:400])
-        print("       Chrome may be too old or too new for this menu layout — set it by hand.")
         return
 
     print("       %s" % res)
     ok, exc = js_works(chrome, targets)
     if ok:
         print("[ok] Chrome now runs JavaScript from Apple Events.")
-        print("     The running watchdog picks this up on its next cycle — nothing to restart.")
-        print("     Next: ./watchgrafana.py probe")
-    elif exc and JS_DISABLED_MARK in exc.msg:
-        print("[FAIL] the click landed but the setting is still off — it may have been ON and")
-        print("       just got switched OFF. Run this command once more to toggle it back.")
-    else:
-        print("[FAIL] still cannot run JavaScript: %s" % (exc.msg[:300] if exc else "unknown"))
+        print("     The running watchdog picks this up on its next cycle.")
+        return
+    print("[FAIL] The click reported success but the setting did not change.")
+    print("       Some machines ignore synthetic clicks on this item entirely.")
+    print("       Use ./enable-js-restart.py instead - it writes the pref directly.")
 
 
 def cmd_run(cfg, chrome, args):
     LOG.info("watchgrafana started (interval %ss, roles %s, pixel_check=%s)",
              cfg["interval_seconds"], cfg["role_order"], cfg["pixel_check"])
     state = load_state()
+    cache = {}
     while True:
         started = time.time()
         try:
-            cycle(cfg, chrome, state)
+            cycle(cfg, chrome, state, cache=cache)
         except OsaError as exc:
             LOG.error("cycle failed talking to Chrome: %s", exc.msg[:200])
+            cache.pop("targets", None)
         except Exception as exc:  # never let the watchdog die
             LOG.exception("cycle raised: %s", exc)
-        time.sleep(max(2.0, cfg["interval_seconds"] - (time.time() - started)))
+            cache.pop("targets", None)
+        time.sleep(max(1.0, cfg["interval_seconds"] - (time.time() - started)))
 
 
 def cmd_once(cfg, chrome, args):
     state = load_state()
-    cycle(cfg, chrome, state, dry_run="--dry-run" in args)
+    cycle(cfg, chrome, state, dry_run="--dry-run" in args, cache={})
 
 
 COMMANDS = {

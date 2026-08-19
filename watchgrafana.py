@@ -306,6 +306,45 @@ on run argv
 end run
 """
 
+ENABLE_JS_SCPT = """
+on run argv
+  set appName to item 1 of argv
+  tell application appName to activate
+  delay 0.6
+  tell application "System Events"
+    tell process appName
+      click menu bar item "View" of menu bar 1
+      delay 0.35
+      click menu item "Developer" of menu 1 of menu bar item "View" of menu bar 1
+      delay 0.35
+      set dev to menu 1 of menu item "Developer" of menu 1 of menu bar item "View" of menu bar 1
+      set seen to ""
+      set hit to ""
+      repeat with mi in (every menu item of dev)
+        set n to ""
+        try
+          set n to name of mi
+        end try
+        if n is not "" then
+          if seen is not "" then set seen to seen & " | "
+          set seen to seen & n
+          if n contains "Apple Events" then
+            set hit to n
+            click mi
+            exit repeat
+          end if
+        end if
+      end repeat
+      if hit is "" then
+        key code 53
+        return "NOTFOUND: " & seen
+      end if
+      return "CLICKED: " & hit
+    end tell
+  end tell
+end run
+"""
+
 NUDGE_SCPT = """
 on run argv
   set appName to item 1 of argv
@@ -1075,6 +1114,7 @@ def cmd_doctor(cfg, chrome, args):
                 print("[FAIL] Chrome blocks JavaScript from Apple Events — blank-page detection and")
                 print("       scrolling need it. Fix (one click, no restart):")
                 print("         Chrome menu bar > View > Developer > Allow JavaScript from Apple Events")
+                print("       ...or let the tool click it for you:  ./watchgrafana.py enable-js")
             else:
                 print("[FAIL] JavaScript probe failed: %s" % exc.msg[:200])
 
@@ -1185,6 +1225,72 @@ def cmd_test(cfg, chrome, args):
     recover(cfg, chrome, targets, trigger, ["forced by `watchgrafana test`"], hard=False)
 
 
+NO_AX_MARKS = ("assistive access", "-25211", "-1719", "not authorized",
+               "not allowed", "1002")
+
+
+def js_works(chrome, targets):
+    for role, (win, tab) in targets.items():
+        try:
+            chrome.js(win["id"], tab, "1+1")
+            return True, None
+        except OsaError as exc:
+            return False, exc
+    return False, None
+
+
+def cmd_enable_js(cfg, chrome, args):
+    """Tick Chrome's View > Developer > Allow JavaScript from Apple Events for us."""
+    targets, _ = resolve_roles(cfg, chrome)
+    if not targets:
+        print("No Chrome window has the dashboard open, so there is nothing to verify against.")
+        return
+
+    ok, exc = js_works(chrome, targets)
+    if ok:
+        print("[ok] Chrome already allows JavaScript from Apple Events — nothing to do.")
+        return
+    if exc and JS_DISABLED_MARK not in exc.msg:
+        print("[FAIL] JavaScript is failing for a different reason:\n       %s" % exc.msg[:300])
+        return
+
+    print("Clicking View > Developer > Allow JavaScript from Apple Events ...")
+    try:
+        res = osa(ENABLE_JS_SCPT, cfg["browser_app"], timeout=30)
+    except OsaError as exc:
+        low = exc.msg.lower()
+        if any(m in low for m in NO_AX_MARKS):
+            print("[FAIL] This terminal is not allowed to control other apps' menus yet.")
+            print()
+            print("       Grant it once, then re-run this command:")
+            print("         System Settings > Privacy & Security > Accessibility")
+            print("         > turn ON the app you are running this from (Terminal / iTerm)")
+            print()
+            print("       macOS may have just shown you that prompt. Approving it is what")
+            print("       lets the watchdog re-arm this Chrome setting after Chrome updates.")
+        else:
+            print("[FAIL] could not drive the menu: %s" % exc.msg[:300])
+        return
+
+    if res.startswith("NOTFOUND"):
+        print("[FAIL] no 'Apple Events' item in Chrome's Developer menu. Items found:")
+        print("       %s" % res.split(":", 1)[1].strip()[:400])
+        print("       Chrome may be too old or too new for this menu layout — set it by hand.")
+        return
+
+    print("       %s" % res)
+    ok, exc = js_works(chrome, targets)
+    if ok:
+        print("[ok] Chrome now runs JavaScript from Apple Events.")
+        print("     The running watchdog picks this up on its next cycle — nothing to restart.")
+        print("     Next: ./watchgrafana.py probe")
+    elif exc and JS_DISABLED_MARK in exc.msg:
+        print("[FAIL] the click landed but the setting is still off — it may have been ON and")
+        print("       just got switched OFF. Run this command once more to toggle it back.")
+    else:
+        print("[FAIL] still cannot run JavaScript: %s" % (exc.msg[:300] if exc else "unknown"))
+
+
 def cmd_run(cfg, chrome, args):
     LOG.info("watchgrafana started (interval %ss, roles %s, pixel_check=%s)",
              cfg["interval_seconds"], cfg["role_order"], cfg["pixel_check"])
@@ -1207,6 +1313,7 @@ def cmd_once(cfg, chrome, args):
 
 COMMANDS = {
     "doctor": cmd_doctor, "list": cmd_list, "pin": cmd_pin, "probe": cmd_probe,
+    "enable-js": cmd_enable_js,
     "scroll": cmd_scroll, "once": cmd_once, "run": cmd_run, "test": cmd_test,
     "install": cmd_install, "uninstall": cmd_uninstall, "status": cmd_status,
 }
@@ -1214,6 +1321,7 @@ COMMANDS = {
 USAGE = """watchgrafana — keep two Chrome windows pinned on a Grafana dashboard
 
   doctor              check permissions, windows and roles (start here)
+  enable-js           tick Chrome's "Allow JavaScript from Apple Events" for you
   list                list Chrome windows and which ones match
   pin [id id]         re-pin roles (no args = auto-pin left-to-right)
   probe               one detailed health report per role

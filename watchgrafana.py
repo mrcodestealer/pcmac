@@ -1084,6 +1084,11 @@ def cmd_doctor(cfg, chrome, args):
     print("config      : %s" % CONFIG_PATH)
     print("log         : %s" % os.path.join(HERE, cfg["log_file"]))
     print("match URL   : %r" % cfg["url_contains"])
+    bad = tcc_protected(HERE)
+    if bad:
+        print("[warn] installed under ~/%s, which macOS protects — the launchd agent cannot" % bad)
+        print("       read it there and will die on every respawn. Move it out of ~/%s" % bad)
+        print("       and re-run install. Interactive commands are unaffected.")
 
     try:
         wins = chrome.snapshot(cfg["url_contains"])
@@ -1154,7 +1159,36 @@ def plist_path():
     return os.path.expanduser("~/Library/LaunchAgents/%s.plist" % PLIST_LABEL)
 
 
+PROTECTED_DIRS = ("Downloads", "Desktop", "Documents")
+
+
+def tcc_protected(path):
+    """macOS shields these folders. A launchd agent has no grant for them, so it
+    cannot even read its own script there — Python exits 2 before logging a thing."""
+    home = os.path.expanduser("~")
+    rel = os.path.relpath(os.path.abspath(path), home)
+    if rel.startswith(".."):
+        return None
+    top = rel.split(os.sep)[0]
+    return top if top in PROTECTED_DIRS else None
+
+
 def cmd_install(cfg, chrome, args):
+    bad = tcc_protected(HERE)
+    if bad and "--force" not in args:
+        print("[FAIL] This tool lives in ~/%s, which macOS protects." % bad)
+        print()
+        print("       Your terminal can read it, but the launchd agent runs as a different")
+        print("       process with no access there, so it would die with exit code 2 on every")
+        print("       respawn without ever writing a log line.")
+        print()
+        print("       Move it somewhere unprotected first, then install from there:")
+        print("         mv %s ~/%s" % (HERE, os.path.basename(HERE)))
+        print("         cd ~/%s && ./watchgrafana.py install" % os.path.basename(HERE))
+        print()
+        print("       (./watchgrafana.py install --force installs anyway, if you have granted")
+        print("        Full Disk Access to /usr/bin/python3 yourself.)")
+        return
     script = os.path.join(HERE, "watchgrafana.py")
     body = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

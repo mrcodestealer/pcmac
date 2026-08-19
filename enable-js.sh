@@ -32,17 +32,13 @@ click_menu_item() {
 on run argv
   set appName to item 1 of argv
   tell application appName to activate
-  delay 0.6
+  delay 0.5
   tell application "System Events"
     tell process appName
-      click menu bar item "View" of menu bar 1
-      delay 0.35
-      click menu item "Developer" of menu 1 of menu bar item "View" of menu bar 1
-      delay 0.35
-      set dev to menu 1 of menu item "Developer" of menu 1 of menu bar item "View" of menu bar 1
+      set devMenu to menu "Developer" of menu item "Developer" of menu "View" of menu bar item "View" of menu bar 1
       set seen to ""
-      set hit to ""
-      repeat with mi in (every menu item of dev)
+      set target to missing value
+      repeat with mi in (every menu item of devMenu)
         set n to ""
         try
           set n to name of mi
@@ -50,18 +46,30 @@ on run argv
         if n is not "" then
           if seen is not "" then set seen to seen & " | "
           set seen to seen & n
-          if n contains "Apple Events" then
-            set hit to n
-            click mi
-            exit repeat
-          end if
+          if n contains "Apple Events" then set target to mi
         end if
       end repeat
-      if hit is "" then
-        key code 53
+      if target is missing value then
+        try
+          key code 53
+        end try
         return "NOTFOUND: " & seen
       end if
-      return "CLICKED: " & hit
+      set nm to name of target
+      set mk1 to "none"
+      try
+        set mk1 to (value of attribute "AXMenuItemMarkChar" of target) as text
+      end try
+      click target
+      delay 0.8
+      set mk2 to "none"
+      try
+        set mk2 to (value of attribute "AXMenuItemMarkChar" of target) as text
+      end try
+      try
+        key code 53
+      end try
+      return "CLICKED: " & nm & " (checkmark " & mk1 & " -> " & mk2 & ")"
     end tell
   end tell
 end run

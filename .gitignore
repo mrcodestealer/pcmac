@@ -1,0 +1,12 @@
+# Runtime state — machine-specific, regenerated on demand. Tracking these makes
+# every `git pull` collide, because the agent rewrites them while you pull.
+config.json
+state.json
+layout.json
+logs/
+bin/
+__pycache__/
+*.pyc
+
+# Chrome preference backups written by enable-js-restart.py
+*.bak-*

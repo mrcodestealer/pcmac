@@ -6,11 +6,11 @@
   ],
   "roles": {
     "top": {
-      "window_id": 1080876750,
+      "window_id": null,
       "scroll": "top"
     },
     "bottom": {
-      "window_id": 1080876830,
+      "window_id": null,
       "scroll": "bottom"
     }
   },

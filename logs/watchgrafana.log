@@ -1,9 +1,0 @@
-2026-08-19 08:46:26 ERROR   Chrome is not allowing JavaScript from Apple Events, so blank-page detection and scrolling are both disabled. Fix: Chrome menu bar -> View -> Developer -> Allow JavaScript from Apple Events.
-2026-08-19 08:46:26 INFO    ok — top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?
-2026-08-19 12:49:40 ERROR   Chrome is not allowing JavaScript from Apple Events, so blank-page detection and scrolling are both disabled. Fix: Chrome menu bar -> View > Developer > Allow JavaScript from Apple Events.
-2026-08-19 12:49:40 INFO    ok - top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?
-2026-08-19 12:49:41 INFO    ok - top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?
-2026-08-19 12:49:41 INFO    ok - top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?
-2026-08-19 12:49:41 INFO    ok - top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?
-2026-08-19 12:49:42 INFO    ok - top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?
-2026-08-19 12:51:16 INFO    ok - top: ? panels, scroll ?/? | bottom: ? panels, scroll ?/?

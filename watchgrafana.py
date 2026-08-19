@@ -54,7 +54,10 @@ DEFAULTS = {
     "scroll_settle_delay": 0.5,            # pause between scroll re-applications
     "min_panels": 1,
     "min_body_text": 60,
-    "osascript_timeout": 20,
+    "osascript_timeout": 20,               # control actions (reload, re-navigate)
+    "probe_timeout_seconds": 5,            # health probe; a healthy one answers in ~0.5s,
+                                           # so a stall here IS the symptom, not an excuse
+                                           # to keep waiting
     "pixel_check": "off",                  # off | auto | on
     "white_frac_threshold": 0.80,
     "log_file": "logs/watchgrafana.log",
@@ -726,9 +729,11 @@ def evaluate(cfg, role, meta, probe, white):
     if err:
         bad.append((err, True))
 
-    if cfg["url_contains"] not in (meta.get("url") or ""):
-        bad.append(("tab navigated away from the dashboard (%s)"
-                    % (meta.get("url") or "")[:80], True))
+    # Only judge the URL when we actually read one. A stalled probe reports no URL,
+    # and an unread URL is not evidence the tab went anywhere.
+    url = meta.get("url") or ""
+    if url and cfg["url_contains"] not in url:
+        bad.append(("tab navigated away from the dashboard (%s)" % url[:80], True))
 
     if probe is None:
         # JS unavailable or it threw: only a signal when JS normally works
@@ -890,23 +895,32 @@ def probe_targets(cfg, chrome, targets, want_pixels=False):
         return {}
     specs = [targets[r] for r in roles]
 
-    rows = None
+    probe_tmo = cfg["probe_timeout_seconds"]
+    rows, stalled = None, False
     try:
-        rows = chrome.batch(specs, JS_PROBE)
+        rows = chrome.batch(specs, JS_PROBE, timeout=probe_tmo)
         if len(rows) != len(specs):
             rows = None
-    except OsaError:
+    except OsaError as exc:
+        stalled = exc.timed_out
         rows = None
 
-    if rows is None:
+    if rows is None and stalled:
+        # A tab that normally answers in under half a second has stopped answering,
+        # which is the symptom itself. Do NOT retry per role: recovery reloads both
+        # windows regardless, so working out which one is stuck would only burn
+        # another timeout each and turn a 5s detection into 15s.
+        rows = [_blank_row("renderer stopped answering within %ss" % probe_tmo)
+                for _ in specs]
+    elif rows is None:
         rows = []
         for wid, ti in specs:
             try:
-                got = chrome.batch([(wid, ti)], JS_PROBE)
+                got = chrome.batch([(wid, ti)], JS_PROBE, timeout=probe_tmo)
                 rows.append(got[0] if got else _blank_row("no reply"))
             except OsaError as exc:
                 rows.append(_blank_row(
-                    "renderer did not answer within %ss" % cfg["osascript_timeout"]
+                    "renderer stopped answering within %ss" % probe_tmo
                     if exc.timed_out else exc.msg[:160]))
 
     out = {}
@@ -957,7 +971,7 @@ def wait_for_render(cfg, chrome, targets, deadline):
     while time.time() < deadline:
         time.sleep(cfg["render_poll_seconds"])
         try:
-            rows = chrome.batch(specs, JS_PROBE)
+            rows = chrome.batch(specs, JS_PROBE, timeout=cfg["probe_timeout_seconds"])
         except OsaError:
             continue
         if len(rows) == len(specs) and all(

@@ -62,6 +62,7 @@ restarts the watchdog if it ever dies. `./watchgrafana.py uninstall` removes it.
 | `status` | is the agent running, and how many recoveries lately |
 | `enable-js` | tick Chrome's "Allow JavaScript from Apple Events" (see note below) |
 | `./selftest.py` | verify the injected JS and the health logic without touching the live windows |
+| `./test-timeouts.py` | verify the hung-renderer path costs one timeout, not one per window |
 
 Logs: `logs/watchgrafana.log` (rotated at 2 MB). `tail -f logs/watchgrafana.log`.
 
@@ -94,7 +95,16 @@ Timing at the default 5s interval:
 | | detected within |
 | --- | --- |
 | blank / crashed / login-bounced page | ~5s |
-| half-rendered, hung renderer, white pixels | ~10s |
+| half-rendered dashboard, white pixels | ~10s |
+| **wedged tab that stopped answering** | ~11s |
+
+That last row is the one worth understanding. A white or hung tab is precisely one
+that stops answering JavaScript, so the *probe timeout* is the detection latency —
+which is why `probe_timeout_seconds` (5s) is deliberately separate from
+`osascript_timeout` (20s, for reload and re-navigation, which can legitimately be
+slow). A healthy probe answers in ~0.5s. And when the batched probe stalls, it is
+**not** retried per window: recovery reloads both windows anyway, so identifying
+which one is stuck would only burn another timeout each.
 
 A cycle costs one `osascript` round-trip (~0.45s) because geometry, tab metadata and
 the in-page probe for both windows are fetched together, and the full window/tab
@@ -135,6 +145,7 @@ reload loop.
 | `cooldown_seconds` | `90` | minimum gap between recoveries |
 | `max_recoveries_per_hour` | `12` | hard cap |
 | `render_wait_seconds` | `30` | how long to wait for panels after a reload |
+| `probe_timeout_seconds` | `5` | health-probe deadline; this *is* your detection latency for a wedged tab |
 | `pixel_check` | `off` | `off`, `auto`, `on` — see below |
 | `white_frac_threshold` | `0.80` | fraction of near-white pixels that counts as blank |
 
@@ -192,6 +203,7 @@ config.json       settings (window ids, scroll targets, thresholds)
 state.json        recovery history + bad-check streaks (written at runtime)
 selftest.py       offline tests for the injected JS and the health logic
 test-restore.py   offline tests for the window save/restore logic
+test-timeouts.py  offline tests for the hung-renderer detection path
 enable-js.sh      standalone Chrome-setting enabler (accessibility click)
 enable-js-restart.py  writes the pref directly, restarts Chrome, rebuilds the layout
 whitecheck.m      pixel white-check helper (Objective-C / ScreenCaptureKit)

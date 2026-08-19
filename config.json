@@ -1,0 +1,23 @@
+{
+  "url_contains": "core-metrics-arms-aliyun",
+  "role_order": [
+    "top",
+    "bottom"
+  ],
+  "roles": {
+    "top": {
+      "window_id": 1080876750,
+      "scroll": "top"
+    },
+    "bottom": {
+      "window_id": 1080876830,
+      "scroll": "bottom"
+    }
+  },
+  "interval_seconds": 20,
+  "activate_tab_on_recovery": true,
+  "steady_scroll": "on_reset",
+  "bad_checks_before_action": 2,
+  "cooldown_seconds": 90,
+  "pixel_check": "off"
+}

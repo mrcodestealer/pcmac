@@ -58,11 +58,18 @@ restarts the watchdog if it ever dies. `./watchgrafana.py uninstall` removes it.
 | `once [--dry-run]` | run a single check cycle; `--dry-run` reports without touching anything |
 | `run` | watch forever (this is what launchd runs) |
 | `test` | force the whole recovery path: reload both windows + re-scroll |
+| `start` / `stop` | start or pause the background agent without uninstalling |
 | `status` | is the agent running, and how many recoveries lately |
 | `enable-js` | tick Chrome's "Allow JavaScript from Apple Events" (see note below) |
 | `./selftest.py` | verify the injected JS and the health logic without touching the live windows |
 
 Logs: `logs/watchgrafana.log` (rotated at 2 MB). `tail -f logs/watchgrafana.log`.
+
+Once installed, the agent runs in the background and restarts at login — there is
+nothing to keep open in a terminal, and no Ctrl-C involved. Do **not** also run
+`watchgrafana run` by hand while the agent is installed: two watchdogs will fight
+over reloading and scrolling the same windows. To watch what it is doing, tail the
+log (Ctrl-C stops the tailing, not the watchdog). To pause it, `watchgrafana stop`.
 
 ## What counts as "white"
 

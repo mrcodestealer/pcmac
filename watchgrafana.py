@@ -1240,6 +1240,41 @@ def cmd_uninstall(cfg, chrome, args):
     print("removed %s" % plist_path())
 
 
+def cmd_stop(cfg, chrome, args):
+    """Stop the background agent, keeping it installed so `start` brings it back."""
+    if not os.path.exists(plist_path()):
+        print("not installed — nothing to stop (run: watchgrafana install)")
+        return
+    p = subprocess.run(["/bin/launchctl", "bootout", "gui/%d/%s" % (os.getuid(), PLIST_LABEL)],
+                       capture_output=True, text=True)
+    err = (p.stderr or "").strip()
+    if p.returncode != 0 and "No such process" not in err:
+        print("could not stop it: %s" % (err or "launchctl exit %d" % p.returncode))
+        return
+    print("watchdog stopped. It stays installed — `watchgrafana start` brings it back,")
+    print("and it would also come back by itself at your next login.")
+    print("To stop it for good instead: watchgrafana uninstall")
+
+
+def cmd_start(cfg, chrome, args):
+    """Start the background agent again after `stop`."""
+    if not os.path.exists(plist_path()):
+        print("not installed yet — run: watchgrafana install")
+        return
+    uid = os.getuid()
+    if subprocess.run(["/bin/launchctl", "print", "gui/%d/%s" % (uid, PLIST_LABEL)],
+                      capture_output=True).returncode == 0:
+        print("already running — watchgrafana status")
+        return
+    p = subprocess.run(["/bin/launchctl", "bootstrap", "gui/%d" % uid, plist_path()],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        print("could not start it: %s" % (p.stderr or "").strip())
+        return
+    print("watchdog started. Watch it with:  tail -f %s"
+          % os.path.join(HERE, cfg["log_file"]))
+
+
 def cmd_status(cfg, chrome, args):
     uid = os.getuid()
     p = subprocess.run(["/bin/launchctl", "print", "gui/%d/%s" % (uid, PLIST_LABEL)],
@@ -1358,6 +1393,7 @@ COMMANDS = {
     "enable-js": cmd_enable_js,
     "scroll": cmd_scroll, "once": cmd_once, "run": cmd_run, "test": cmd_test,
     "install": cmd_install, "uninstall": cmd_uninstall, "status": cmd_status,
+    "start": cmd_start, "stop": cmd_stop,
 }
 
 USAGE = """watchgrafana — keep two Chrome windows pinned on a Grafana dashboard
@@ -1371,7 +1407,8 @@ USAGE = """watchgrafana — keep two Chrome windows pinned on a Grafana dashboar
   once [--dry-run]    run a single check cycle
   run                 watch forever (this is what launchd runs)
   test                force the recovery path: reload both + re-scroll
-  install/uninstall   start/stop the launchd agent (auto-start at login)
+  install/uninstall   add/remove the launchd agent (auto-start at login)
+  start / stop        start or pause the background agent without uninstalling
   status              is the agent running, and recent recovery count
 """
 

@@ -66,8 +66,26 @@ Refresh that snapshot whenever you rearrange the wall:
 ./enable-js-restart.py         # writes layout.json, then exits doing nothing else
 ```
 
-(There is no `.bat` — that is Windows. On macOS a `.command` file is the
-double-clickable equivalent.)
+## Windows
+
+`clickthis.bat` + `open-wall.ps1` open the dashboard windows on a Windows machine and
+position them. They do **only** that — there is no watchdog on Windows, because the
+detection and scrolling half drives Chrome through AppleScript, which Windows has no
+equivalent of.
+
+First run, to find your real monitor coordinates:
+
+```bat
+powershell -ExecutionPolicy Bypass -File open-wall.ps1 -ShowScreens
+```
+
+Paste those X/Y/width/height into the `$WallWindows` block near the top of
+`open-wall.ps1` — one entry per window, added or removed freely — then double-click
+`clickthis.bat`. `-DryRun` reports without opening anything.
+
+Windows are identified by *handle*, not by process (Chrome runs every window in one
+process), so it can place several windows showing the same URL. `.gitattributes`
+keeps `.bat`/`.ps1` as CRLF; `cmd.exe` misparses LF-only batch files.
 
 ## Commands
 
@@ -245,7 +263,9 @@ Mac, and a window on a different Mission Control Space cannot be captured at all
 ## Files
 
 ```
-clickthis.command double-click launcher: re-open the windows, then start the watchdog
+clickthis.command double-click launcher (macOS): re-open the windows, start the watchdog
+clickthis.bat     double-click launcher (Windows): open and place the windows only
+open-wall.ps1     the Windows window-placer that clickthis.bat calls
 watchgrafana.py   the watchdog
 config.json       settings (window ids, scroll targets, thresholds)
 state.json        recovery history + bad-check streaks (written at runtime)

@@ -1,0 +1,6 @@
+# Windows scripts must keep CRLF endings or cmd.exe misparses them
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.command text eol=lf
+*.py text eol=lf
+*.sh text eol=lf

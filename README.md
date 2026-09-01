@@ -46,6 +46,29 @@ is fine. `install` refuses to run from a protected folder, and `doctor` warns.
 That loads a launchd agent (`me.junchen.watchgrafana`) which starts at login and
 restarts the watchdog if it ever dies. `./watchgrafana.py uninstall` removes it.
 
+## Bringing the wall back up (after a reboot)
+
+Double-click **`clickthis.command`** in Finder, or run it:
+
+```bash
+./clickthis.command            # --dry-run to see what it would do
+```
+
+It re-opens the saved Chrome windows at their saved positions (launching Chrome if
+needed), waits until the dashboard windows are actually there, then starts the
+watchdog — installing it the first time so it also comes up at every login. Safe to
+run when things are already fine.
+
+It restores from `layout.json`, a snapshot of every Chrome window's tabs and bounds.
+Refresh that snapshot whenever you rearrange the wall:
+
+```bash
+./enable-js-restart.py         # writes layout.json, then exits doing nothing else
+```
+
+(There is no `.bat` — that is Windows. On macOS a `.command` file is the
+double-clickable equivalent.)
+
 ## Commands
 
 | command | what it does |
@@ -222,6 +245,7 @@ Mac, and a window on a different Mission Control Space cannot be captured at all
 ## Files
 
 ```
+clickthis.command double-click launcher: re-open the windows, then start the watchdog
 watchgrafana.py   the watchdog
 config.json       settings (window ids, scroll targets, thresholds)
 state.json        recovery history + bad-check streaks (written at runtime)
